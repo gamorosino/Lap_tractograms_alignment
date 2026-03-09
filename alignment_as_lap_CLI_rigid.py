@@ -18,13 +18,27 @@ from scipy.optimize import linear_sum_assignment
 from scipy.sparse.csgraph import min_weight_full_bipartite_matching  # this is the sparse equivalent to linear_sum_assignment
 from scipy.sparse import csc_matrix
 from nilab.load_trk_numba import load_streamlines
-
+import  pickle
 try:
     from joblib import Parallel, delayed
     joblib_available = True
 except ImportError:
     joblib_available = False
 
+
+def process_tractogram(T, threshold_short_streamlines=10.0, nb_points=16):
+    if nb_points is not None:
+        print("Resampling all streamlines to %s points" % (nb_points,))
+        T = set_number_of_points(T, nb_points)
+
+    T = np.array(T, dtype=object)
+    
+    if threshold_short_streamlines > 0:
+        # Removing short artifactual streamlines
+        print("Removing (presumably artifactual) streamlines shorter than %s" % threshold_short_streamlines)
+        T = np.array([s for s in T if length(s) >= threshold_short_streamlines], dtype=object)
+        print("%s streamlines" % (len(T)))
+    return T
 
 def load_tractogram(T_filename, threshold_short_streamlines=10.0, nb_points=16):
     """Load tractogram from TRK file, resample to the desired number of
@@ -36,17 +50,8 @@ def load_tractogram(T_filename, threshold_short_streamlines=10.0, nb_points=16):
     T, _ ,_ ,_ = load_streamlines(T_filename,verbose=True )
     print("%s: %s streamlines" % (T_filename, len(T)))
 
-    if nb_points is not None:
-        print("Resampling all streamlines to %s points" % (nb_points,))
-        T = set_number_of_points(T, nb_points)
-
-    T = np.array(T, dtype=object)
-    
-    if threshold_short_streamlines > 0:
-        # Removing short artifactual streamlines
-        print("Removing (presumably artifactual) streamlines shorter than %s" % threshold_short_streamlines)
-        T = np.array([s for s in T if length(s) >= threshold_short_streamlines], dtype=object)
-        print("%s: %s streamlines" % (T_filename, len(T)))
+    T = process_tractogram(T, threshold_short_streamlines=threshold_short_streamlines, nb_points=nb_points)
+		
 
     return T
 
@@ -100,7 +105,7 @@ def clustering(S_dr, k, b=100, t=100, S_centers=None):
     return S_representatives_idx, S_cluster_labels
 
 
-def LAP(S_A, S_B, verbose=True, parallel=True, distance_function=bundles_distances_mam,swap=False):
+def LAP(S_A, S_B, verbose=True, parallel=True, distance_function=bundles_distances_mam):
     """
     """
     assert(len(S_B) >= len(S_A))  # required by LAP
@@ -109,29 +114,13 @@ def LAP(S_A, S_B, verbose=True, parallel=True, distance_function=bundles_distanc
         print("Computing the distance matrix between the two sets of streamlines.")
 
     dm_AB = streamline_distance(S_A, S_B, parallel=parallel,
-                                distance_function=distance_function,swap=swap)
+                                distance_function=distance_function)
     _, corresponding_streamlines = linear_sum_assignment(dm_AB)
     return corresponding_streamlines
 
 
-def bundles_distances_mdf_flip(S_A, S_B):
-
-    S_B = np.array(S_B)
-    S_A = np.array(S_A)    
-    d1=bundles_distances_mdf(S_A, S_B)
-    d2=bundles_distances_mdf(S_A, S_B[:,::-1,:])
-    return np.min([d1[0][0],d2[0][0]])
-
-def streamlines_rmse(S_A, S_B):
-    S_B = np.array(S_B)
-    S_A = np.array(S_A)  
-    d1 = np.sqrt(np.sum((S_A - S_B)**2, axis=0))
-    d2=np.sqrt(np.sum((S_A - S_B[:,::-1,:])**2, axis=0))
-    return np.min([d1,d2])
-    
-
 def streamline_distance(S_A, S_B=None, parallel=True,
-                        distance_function=bundles_distances_mam,swap=False):
+                        distance_function=bundles_distances_mam):
     """Wrapper to decide what streamline distance function to use. The
     function computes the distance matrix between sets of
     streamlines. This implementation provides optimiztions like
@@ -139,36 +128,24 @@ def streamline_distance(S_A, S_B=None, parallel=True,
     None.
     """
     # distance_function = bundles_distances_mdf
-    if swap:
-        if parallel:
-            return dissimilarity(S_B, S_A, distance_function)
-        else:
-            return distance_function(S_B, S_A)
+    if parallel:
+        return dissimilarity(S_A, S_B, distance_function)
     else:
-        if parallel:
-            return dissimilarity(S_A, S_B, distance_function)
-        else:
-            return distance_function(S_A, S_B)
+        return distance_function(S_A, S_B)
+
 
 def distance_corresponding(A, B, correspondence,
-                           distance_function=bundles_distances_mam,swap=False):
+                           distance_function=bundles_distances_mam):
     """Distance between streamlines in set A and the corresponding ones in
     B. The vector 'correspondence' has in position 'i' the index of
     the streamline in B that corresponds to A[i].
 
     """
-    if swap:
-        return np.array([streamline_distance([B[correspondence[i]]],
-                                            [A[i]],
-                                            parallel=False,
-                                            distance_function=distance_function)
-                        for i in range(len(A))]).squeeze()
-    else:
-        return np.array([streamline_distance([A[i]],
-                                            [B[correspondence[i]]],
-                                            parallel=False,
-                                            distance_function=distance_function)
-                        for i in range(len(A))]).squeeze()        
+    return np.array([streamline_distance([A[i]],
+                                         [B[correspondence[i]]],
+                                         parallel=False,
+                                         distance_function=distance_function)
+                     for i in range(len(A))]).squeeze()
 
 
 def LAP_two_clusters(cluster_A, cluster_B, alpha=0.5, max_iter1=100,
@@ -273,7 +250,7 @@ def alignment_as_LAP(T_A, T_B,
                      t=100,
                      T_A_dr=None,  # precomputed dissimilarity representation, useful for large experiments
                      T_B_dr=None,
-                     distance_function=bundles_distances_mam,swap=False):
+                     distance_function=bundles_distances_mam):
 
     # 2) Compute the dissimilarity representation of T_A and T_B
     if T_A_dr is None:
@@ -309,7 +286,7 @@ def alignment_as_LAP(T_A, T_B,
     distance_clusters = distance_corresponding(T_A[T_A_representatives_idx],
                                                T_B[T_B_representatives_idx],
                                                corresponding_clusters,
-                                               distance_function=distance_function,swap=swap)
+                                               distance_function=distance_function)
     print("Median distance between corresponding clusters: %s" % np.median(distance_clusters))
 
     # 5) For each pair corresponding cluster, compute LAP
@@ -339,16 +316,25 @@ def loadTrk(filename):
     header = data.header
     return s,aff,header
 
+def load_pickle(filename):
+	with open(filename, "rb") as f:
+		output = pickle.load(f)
+	return output
+def get_ext(file_name):
+    
+    output_ext = file_name[file_name.rfind('.')+1:]
+    return  output_ext 
+
 if __name__ == '__main__':
     print(__doc__)
     np.random.seed(0)
     if len(sys.argv) < 4:
-        print(sys.argv[0]+' <tract_1.ext> <tract_2.ext> <csv_out> [<clustering_flag>]')
+        print(sys.argv[0]+' <tract_1.ext> <tract_2.ext> <csv_out> [<clustering_flag>] [<corrispondance_only>] [<affine.mat>]')
         sys.exit()
 
     T_A_filename = sys.argv[1] #'data/sub-500222/dt-neuro-track-trk.tag-ensemble.tag-t1.id-605a1e1c73b69eaef86d2f54/track.trk'
     T_B_filename = sys.argv[2] #'data/sub-506234/dt-neuro-track-trk.tag-ensemble.tag-t1.id-605a1ee373b69e81bf6d34f9/track.trk'
-    output_csv = sys.argv[3]
+    output_file = sys.argv[3]
     try:
         clustering_flag = bool(int(sys.argv[4]))
     except:
@@ -358,6 +344,10 @@ if __name__ == '__main__':
         corris_only = bool(int(sys.argv[5]))
     except:
         corris_only = True
+    try:
+        srm_file = sys.argv[6]
+    except:
+        srm_file = None
     # T_B_filename = T_A_filename
 
     distance_function = bundles_distances_mam  # bundles_distances_mdf is faster
@@ -375,14 +365,29 @@ if __name__ == '__main__':
 
     # 1) load T_A and T_B
     
-    if clustering_flag:
-    
-        T_moving = load_tractogram(T_A_filename,
+ 
+
+    T_moving = load_tractogram(T_A_filename,
 								   threshold_short_streamlines=threshold_short_streamlines,
 								   nb_points=nb_points)
-        T_static = load_tractogram(T_B_filename,
+    if srm_file is not None:
+        print('apply rigid transformation')		
+        print("read srm file "+srm_file)
+        srm=load_pickle(srm_file)
+        print('apply rigid tranformation to the moving tractogram...')
+        T_moving = srm.transform(T_moving)
+        T_moving = process_tractogram(T_moving,threshold_short_streamlines=0)
+        
+    T_static = load_tractogram(T_B_filename,
 								   threshold_short_streamlines=threshold_short_streamlines,
                                nb_points=nb_points)
+
+			   
+    if clustering_flag:
+    
+
+                              
+
         correspondence, distances = alignment_as_LAP(T_A=T_moving,
                                                  T_B=T_static,
                                                  k=k,
@@ -392,8 +397,8 @@ if __name__ == '__main__':
                                                  distance_function=distance_function)
     else:
         print('no clustering')
-        T_moving, _ , _ = loadTrk(T_A_filename)
-        T_static, _ , _  = loadTrk(T_B_filename)
+        #T_moving, _ , _ = loadTrk(T_A_filename)
+        #T_static, _ , _  = loadTrk(T_B_filename)
         #%% Resample Streamlines
         print("setting the same number of points...")
         #T_moving = np.array(T_moving)
@@ -405,15 +410,29 @@ if __name__ == '__main__':
                                            distance_function=distance_function)
 
 
+
     
 
-    print("Saving the result into " + output_csv)
+    print("Saving the result into " + output_file)
     if corris_only:
-        np.savetxt(output_csv, correspondence, fmt='%d')
+        np.savetxt(output_file, correspondence, fmt='%d')
     else:
         result = np.vstack([range(len(correspondence)), correspondence]).T
-        np.savetxt(output_csv, result, fmt='%d', delimiter=',',
-				   header='ID_A,ID_B')
+        np.savetxt(output_file, result, fmt='%d', delimiter=',',
+				   header='ID_A,ID_B')    
+
+    #print("Saving the result into " + output_file)
+    #if corris_only:
+    #    if get_ext(output_file) =='csv' or get_ext(output_file) =='txt':
+    #        np.savetxt(output_file, correspondence, fmt='%d')
+    #    elif get_ext(output_file) == "npy":
+    #        np.save(output_file, correspondence)
+    #else:
+    #   result = np.vstack([range(len(correspondence)), correspondence]).T
+    #    if get_ext(output_file) =='csv' or get_ext(output_file) =='txt':
+    #        np.savetxt(output_file, result, fmt='%d', delimiter=',',header='ID_A,ID_B')
+    #    elif get_ext(output_file) == "npy":
+    #        np.save(output_file, result)
 
     plot_flag = False
     if plot_flag:
